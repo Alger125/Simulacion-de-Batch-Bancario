@@ -21,8 +21,11 @@ Job de procesamiento por lotes (**Spring Batch 2.1.7** sobre **Java 8**) que lee
 13. [Descripción de cada clase](#-descripción-de-cada-clase)
 14. [Configuración XML (Spring Beans)](#-configuración-xml-spring-beans)
 15. [Configuración SQL (.properties)](#-configuración-sql-properties)
-16. [Solución de problemas comunes](#-solución-de-problemas-comunes)
-17. [Glosario para juniors](#-glosario-para-juniors)
+16. [CI/CD con GitHub Actions](#-cicd-con-github-actions)
+17. [Despliegue en Kubernetes](#-despliegue-en-kubernetes)
+18. [Ramas del repositorio](#-ramas-del-repositorio)
+19. [Solución de problemas comunes](#-solución-de-problemas-comunes)
+20. [Glosario para juniors](#-glosario-para-juniors)
 
 ---
 
@@ -47,6 +50,8 @@ Implementa el Job **`LOXJ162-01-MX`**, un proceso batch bancario.
 | JUnit / Mockito | 4.13.2 / 3.12.4 | Pruebas unitarias |
 | JaCoCo | 0.8.8 | Cobertura de código |
 | Docker + Docker Compose | Docker Desktop reciente | Orquestación del entorno completo |
+| GitHub Actions | checkout@v4, setup-java@v4, buildx@v3 | CI/CD: compila con Maven y valida la imagen Docker en cada push/PR a `main` |
+| Kubernetes | batch/v1 (kind: Job) | Ejecución del batch como Job en un clúster (`k8s/simulacion-job.yml`) |
 
 ---
 
@@ -436,6 +441,13 @@ Simulacion-de-Batch-Bancario/
 ├── docker-compose.yml               ← Orquesta oracle-db + batch-job
 ├── .env                             ← Variables: ORACLE_PASSWORD, ODATE, DESKTOP_PATH
 │
+├── .github/
+│   └── workflows/
+│       └── ci-cd.yml                ← Pipeline CI/CD: Maven build + validación de imagen Docker
+│
+├── k8s/
+│   └── simulacion-job.yml           ← Manifiesto Kubernetes: Job batch (kind: Job)
+│
 ├── loxc001/                         ← Módulo COMMONS (el diccionario)
 │   └── src/main/java/com/prueba/lox/batch/
 │       ├── model_1/MovimientoDTO.java    ← Objeto que representa un movimiento
@@ -708,6 +720,216 @@ AND ESTATUS_SALDO = 'VIGENTE'
 
 ---
 
+## 🚀 CI/CD con GitHub Actions
+
+El repositorio incluye un pipeline de integración continua en `.github/workflows/ci-cd.yml` llamado **"CI/CD Pipeline - Simulación Bancaria"**.
+
+### ¿Cuándo se ejecuta?
+
+| Evento | Rama | ¿Qué significa? |
+|---|---|---|
+| `push` | `main` | Cada vez que se sube un commit directo a `main` |
+| `pull_request` | `main` | Cada vez que se abre o actualiza un PR hacia `main` |
+
+> Esto garantiza que **ningún código roto llegue a `main`**: si el build de Maven o la imagen Docker fallan, el PR aparece con una ❌ roja y no debería mergearse.
+
+### ¿Qué hace el pipeline? (job `build-and-test`)
+
+Corre sobre `ubuntu-latest` y ejecuta 5 pasos en orden:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│ 1. actions/checkout@v4                                     │
+│    Descarga el código del repositorio al runner            │
+├────────────────────────────────────────────────────────────┤
+│ 2. actions/setup-java@v4                                   │
+│    Instala JDK 17 (Temurin) + activa caché de Maven        │
+│    (la caché acelera builds posteriores: no re-descarga    │
+│    todas las dependencias cada vez)                        │
+├────────────────────────────────────────────────────────────┤
+│ 3. mvn -B package --file pom.xml                           │
+│    Compila los 3 módulos, ejecuta los tests unitarios      │
+│    y genera el fat JAR (-B = modo batch, sin colores       │
+│    ni prompts interactivos)                                │
+├────────────────────────────────────────────────────────────┤
+│ 4. docker/setup-buildx-action@v3                           │
+│    Prepara Docker Buildx (motor de builds avanzado)        │
+├────────────────────────────────────────────────────────────┤
+│ 5. docker/build-push-action@v5  (push: false)              │
+│    Construye la imagen con el Dockerfile multi-stage       │
+│    SOLO para validar que compila — no la publica en        │
+│    ningún registry                                         │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Detalles importantes:**
+
+- El pipeline compila con **JDK 17** (target `1.8` definido en el POM), pero la **ejecución** del Job sigue siendo sobre **JRE 8** dentro del contenedor. Compilar con un JDK moderno con target 1.8 es válido; ejecutar con Java 9+ no lo es (por XStream/reflexión).
+- `push: false` significa que la imagen **no se sube** a Docker Hub ni a GHCR: el paso existe únicamente como *smoke test* del `Dockerfile`. Si en el futuro quieres publicar la imagen, cambia a `push: true` y agrega un paso de `docker/login-action` con secretos (`DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`).
+- Puedes ver las ejecuciones en la pestaña **Actions** del repositorio en GitHub.
+
+### Ver el estado del pipeline
+
+```
+https://github.com/Alger125/Simulacion-de-Batch-Bancario/actions
+```
+
+---
+
+## ☸️ Despliegue en Kubernetes
+
+Además de Docker Compose, el proyecto incluye un manifiesto para correr el proceso como un **Job de Kubernetes**: `k8s/simulacion-job.yml`.
+
+### ¿Por qué `kind: Job` y no `Deployment`?
+
+Un batch bancario es un proceso que **inicia, procesa y termina**. Un `Deployment` mantendría el pod vivo y lo reiniciaría al terminar (¡en bucle infinito!). Un `Job` en cambio:
+
+- Ejecuta el pod **una vez** hasta completarse
+- Marca el Job como `Complete` si el contenedor sale con código 0
+- Con `restartPolicy: Never`, si falla **no reintenta** (comportamiento controlado)
+
+### Anatomía del manifiesto
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: batch-bancario-job
+spec:
+  template:
+    spec:
+      hostAliases:                          # ①
+      - ip: "192.168.1.215"
+        hostnames:
+        - "oracle-db"
+      containers:
+        - name: simulacion-container
+          image: simulacion-bancaria:local  # ②
+          imagePullPolicy: Never            # ③
+          args: ["META-INF/spring/batch/jobs/lox-job.xml", "LOXJ162-01-MX", "odate=20260706"]  # ④
+      restartPolicy: Never                  # ⑤
+```
+
+| # | Elemento | Explicación |
+|---|---|---|
+| ① | `hostAliases` | Inyecta una entrada en el `/etc/hosts` del pod: el hostname `oracle-db` (el mismo que usa `lox-beans.xml` en la URL JDBC) resuelve a la IP de la máquina donde corre Oracle. Así **no hay que tocar el XML** para desplegar en K8s. ⚠️ Ajusta la IP `192.168.1.215` a la de tu máquina/servidor de BD |
+| ② | `image: simulacion-bancaria:local` | Nombre de la imagen local. Debes construirla antes con ese tag |
+| ③ | `imagePullPolicy: Never` | Kubernetes **no intenta descargar** la imagen de ningún registry: usa la que ya existe en el nodo. Ideal para clústeres locales (Docker Desktop, minikube, kind) |
+| ④ | `args` | Sobrescribe el `CMD` del Dockerfile (el `ENTRYPOINT` `java -jar /app/app.jar` se conserva). Aquí defines qué job y qué `odate` correr, **sin reconstruir la imagen** |
+| ⑤ | `restartPolicy: Never` | Si el Job falla, el pod queda en `Failed` para que inspecciones los logs, en vez de reintentar a ciegas |
+
+### Paso a paso para desplegar
+
+```bash
+# 1. Construir la imagen con el tag que espera el manifiesto
+docker build -t simulacion-bancaria:local .
+
+# (Si usas minikube, carga la imagen en su daemon:)
+minikube image load simulacion-bancaria:local
+
+# 2. Asegúrate de que Oracle esté corriendo y accesible en la IP del hostAlias
+docker compose up -d oracle-db
+
+# 3. Editar la IP del hostAlias si es necesario (la de TU máquina)
+#    k8s/simulacion-job.yml → hostAliases.ip
+
+# 4. Aplicar el manifiesto
+kubectl apply -f k8s/simulacion-job.yml
+
+# 5. Monitorear
+kubectl get jobs                              # estado del Job
+kubectl get pods                              # pod creado por el Job
+kubectl logs -f job/batch-bancario-job        # logs en vivo
+
+# 6. Re-ejecutar (los Jobs son inmutables: hay que borrarlo primero)
+kubectl delete job batch-bancario-job
+kubectl apply -f k8s/simulacion-job.yml
+```
+
+### Cambiar el `odate` en Kubernetes
+
+Edita la línea `args` del manifiesto y vuelve a aplicar:
+
+```yaml
+args: ["META-INF/spring/batch/jobs/lox-job.xml", "LOXJ162-01-MX", "odate=20260708"]
+```
+
+> **Nota:** en este manifiesto el archivo de salida se escribe en el `/tmp` **del contenedor** y se pierde al terminar el pod. Para conservarlo, agrega un `volumeMount` con un `hostPath` o `PersistentVolumeClaim` apuntando a `/tmp`.
+
+---
+
+## 🌿 Ramas del repositorio
+
+El repositorio sigue un flujo tipo **GitHub Flow**: las funcionalidades se desarrollan en ramas `feature/*` y se integran a `main` mediante Pull Requests.
+
+### Ramas activas
+
+| Rama | Rol | Último commit | Contenido |
+|---|---|---|---|
+| `main` | 🟢 **Rama principal y estable.** Es la rama por defecto y la más actualizada; contiene TODO el proyecto: los 3 módulos Maven, Docker, el pipeline CI/CD **y** los manifiestos de Kubernetes | `638babd` — *feat: agrega manifiestos de Kubernetes para jobs batch y actualiza Dockerfile* | Todo lo descrito en este README |
+| `feature/pipeline-github` | 🔧 **Rama de feature** donde se desarrolló el pipeline de GitHub Actions (`.github/workflows/ci-cd.yml`). Fue integrada a `main` vía **PR #1** y luego sincronizada de vuelta con **PR #2** | `d0ae648` — *Merge pull request #2 from Alger125/main* | Igual a `main` **excepto**: no incluye la carpeta `k8s/` ni la última versión del `Dockerfile` |
+
+### Diferencia actual entre ramas
+
+`main` está **1 commit adelante** de `feature/pipeline-github`:
+
+```
+main  vs  feature/pipeline-github
+──────────────────────────────────
+ Dockerfile             | 25 líneas modificadas (refactor ENTRYPOINT/CMD)
+ k8s/simulacion-job.yml | 18 líneas nuevas (manifiesto Kubernetes)
+```
+
+### Historial de commits (grafo)
+
+```
+* 638babd (main) feat: agrega manifiestos de Kubernetes para jobs batch y actualiza Dockerfile
+| *   d0ae648 (feature/pipeline-github) Merge pull request #2 from Alger125/main
+| |\
+| |/
+|/|
+* | 1fb73a9 Merge pull request #1 from Alger125/feature/pipeline-github
+|\|
+| * 460cb15 feat: agrega pipeline de CI/CD para compilar con Maven y Docker
+* | 016034b Update print statement from 'Hello' to 'Goodbye'
+|/
+* e32f6ab Configuración inicial de la simulación de batch bancario
+```
+
+**Lectura del historial, de abajo hacia arriba:**
+
+1. `e32f6ab` — Configuración inicial: se sube toda la simulación del batch bancario (módulos Maven, Docker Compose, tests).
+2. `016034b` — Ajuste menor en `main`.
+3. `460cb15` — En la rama `feature/pipeline-github` se crea el workflow de CI/CD.
+4. `1fb73a9` — **PR #1**: el pipeline se mergea a `main`. Desde aquí, cada push/PR a `main` compila y valida la imagen Docker automáticamente.
+5. `d0ae648` — **PR #2**: `main` se mergea de vuelta a `feature/pipeline-github` para sincronizarla.
+6. `638babd` — Se agregan los manifiestos de Kubernetes (`k8s/`) y se refactoriza el `Dockerfile` (separación `ENTRYPOINT`/`CMD` para poder sobrescribir argumentos desde K8s).
+
+### Cómo trabajar con las ramas
+
+```bash
+# Ver todas las ramas (locales y remotas)
+git branch -a
+
+# Cambiar a la rama de feature
+git checkout feature/pipeline-github
+
+# Volver a main
+git checkout main
+
+# Crear una nueva feature siguiendo la convención del repo
+git checkout main
+git pull origin main
+git checkout -b feature/nombre-de-tu-feature
+
+# Al terminar: push y abrir Pull Request hacia main
+git push -u origin feature/nombre-de-tu-feature
+```
+
+> **Convención sugerida:** ramas `feature/<descripcion>` para funcionalidades nuevas, commits con prefijos tipo *Conventional Commits* (`feat:`, `fix:`, `docs:`, `refactor:`), y todo cambio a `main` pasa por Pull Request para que el pipeline de CI valide el build antes del merge.
+
+---
+
 ## 🔧 Solución de problemas comunes
 
 | Síntoma | Causa probable | Solución |
@@ -752,6 +974,18 @@ AND ESTATUS_SALDO = 'VIGENTE'
 | **Fat JAR (shade)** | Un JAR que incluye todas las dependencias adentro; se ejecuta con `java -jar` sin más |
 | **Multi-stage build** | Dockerfile con dos etapas: una compila (pesada) y otra ejecuta (ligera) |
 | **Healthcheck** | Comando que Docker ejecuta para saber si un contenedor está "sano" antes de arrancar otros |
+| **CI/CD** | *Integración/Entrega Continua*: automatizar compilación, pruebas y validación en cada cambio |
+| **GitHub Actions** | Servicio de GitHub que ejecuta pipelines (workflows) automáticamente ante eventos como push o PR |
+| **Workflow** | Archivo YAML en `.github/workflows/` que describe qué hace el pipeline y cuándo se dispara |
+| **Runner** | Máquina (aquí `ubuntu-latest`) donde GitHub ejecuta los pasos del workflow |
+| **Kubernetes (K8s)** | Orquestador de contenedores: decide dónde y cómo corren los pods en un clúster |
+| **Job (K8s)** | Recurso de Kubernetes para procesos que corren una vez y terminan (ideal para batch) |
+| **Pod** | La unidad mínima de ejecución en Kubernetes; envuelve uno o más contenedores |
+| **Manifiesto** | Archivo YAML que describe un recurso de Kubernetes (`kubectl apply -f ...`) |
+| **hostAliases** | Entradas extra en el `/etc/hosts` del pod para resolver hostnames a IPs fijas |
+| **Rama (branch)** | Línea de desarrollo paralela en Git; aquí: `main` y `feature/pipeline-github` |
+| **Pull Request (PR)** | Solicitud de integrar una rama en otra, con revisión y validación de CI incluidas |
+| **Merge** | Acción de integrar los commits de una rama dentro de otra |
 
 ---
 
