@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xmlns:batch="http://www.springframework.org/schema/batch"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans
+           http://www.springframework.org/schema/beans/spring-beans.xsd
+           http://www.springframework.org/schema/batch
+           http://www.springframework.org/schema/batch/spring-batch.xsd">
+
+    <bean id="dataSource" class="org.apache.commons.dbcp.BasicDataSource" destroy-method="close">
+        <property name="driverClassName" value="oracle.jdbc.driver.OracleDriver" />
+        <!--<property name="url" value="jdbc:oracle:thin:@host.docker.internal:1521:xe" />-->
+        <property name="url" value="jdbc:oracle:thin:@oracle-db:1521:XE" />
+        <property name="username" value="system" />
+        <property name="password" value="M@t@d0r5412" />
+    </bean>
+
+    <bean id="jdbcTemplate" class="org.springframework.jdbc.core.JdbcTemplate">
+        <property name="dataSource" ref="dataSource" />
+    </bean>
+
+    <bean id="transactionManager" class="org.springframework.jdbc.datasource.DataSourceTransactionManager">
+        <property name="dataSource" ref="dataSource"/>
+    </bean>
+
+    <bean id="jobRepository" class="org.springframework.batch.core.repository.support.JobRepositoryFactoryBean">
+        <property name="dataSource" ref="dataSource"/>
+        <property name="transactionManager" ref="transactionManager"/>
+        <property name="databaseType" value="oracle"/>
+    </bean>
+
+    <bean id="jobLauncher" class="org.springframework.batch.core.launch.support.SimpleJobLauncher">
+        <property name="jobRepository" ref="jobRepository"/>
+    </bean>
+
+    <bean class="org.springframework.batch.core.scope.StepScope"/>
+
+    <bean id="propertyConfigurer" class="org.springframework.beans.factory.config.PropertyPlaceholderConfigurer">
+        <property name="location" value="classpath:sql-LOXBR001IMP.properties" />
+    </bean>
+
+    <bean id="itemReaderJob" class="org.springframework.batch.item.database.JdbcCursorItemReader" scope="step">
+        <property name="dataSource" ref="dataSource" />
+        <property name="sql" value="${sql.select.verificacion_de_datos}" />
+        <property name="fetchSize" value="1000" />
+        <property name="preparedStatementSetter">
+            <bean class="org.springframework.batch.core.resource.ListPreparedStatementSetter">
+                <property name="parameters">
+                    <list>
+                        <value>#{jobParameters['odate']}</value>
+                    </list>
+                </property>
+            </bean>
+        </property>
+        <property name="rowMapper">
+            <bean class="com.prueba.lox.batch.mapper.PimientosMapper" />
+        </property>
+    </bean>
+
+    <bean id="itemProcessorJob" class="com.prueba.lox.batch.Process" scope="step">
+        <property name="loxR174" ref="loxR174Impl"/>
+    </bean>
+
+    <bean id="itemWriterJob" class="org.springframework.batch.item.file.FlatFileItemWriter" scope="step">
+        <property name="resource" value="file:/tmp/LOX_D02_#{jobParameters['odate'] != null ? jobParameters['odate'] : new java.text.SimpleDateFormat('yyyyMMdd').format(new java.util.Date())}.txt"/>
+        <property name="lineAggregator">
+            <bean class="org.springframework.batch.item.file.transform.PassThroughLineAggregator"/>
+        </property>
+    </bean>
+
+    <bean id="loxR174Impl" class="com.prueba.lox.lib.r174.impl.LOXR174Impl">
+        <property name="jdbcTemplate" ref="jdbcTemplate" />
+        <property name="sqlDetalleSaldos" value="${sql.select.detalle_saldos_cuenta}" />
+    </bean>
+
+    <bean id="beanCompletedJob" class="com.prueba.lox.batch.Complete" scope="step">
+        <property name="loxR174" ref="loxR174Impl"/>
+    </bean>
+
+    <bean id="beanFailedJob" class="com.prueba.lox.batch.Failed" scope="step">
+        <property name="loxR174" ref="loxR174Impl"/>
+    </bean>
+
+</beans>

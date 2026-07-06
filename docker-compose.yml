@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  oracle-db:
+    image: gvenzl/oracle-xe:21-slim
+    container_name: oracle-db
+    environment:
+      - ORACLE_PASSWORD=${ORACLE_PASSWORD}
+    ports:
+      - "1521:1521"
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+    networks:
+      - batch-network
+    healthcheck:
+      # Inyectamos de forma segura la contraseña también en el script de verificación
+      test: ["CMD-SHELL", "echo 'SELECT 1 FROM DUAL;' | sqlplus -s SYSTEM/${ORACLE_PASSWORD}@localhost:1521/XE || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  batch-job:
+    build: .
+    container_name: batch-job
+    environment:
+      - ODATE=${ODATE}
+    volumes:
+      # La ruta de Windows ahora es dinámica y segura
+      - ${DESKTOP_PATH}:/tmp
+    depends_on:
+      oracle-db:
+        condition: service_healthy
+    networks:
+      - batch-network
+
+networks:
+  batch-network:
+    driver: bridge
+
+volumes:
+  oracle-data:
